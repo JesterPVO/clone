@@ -2,6 +2,7 @@ import os
 import sqlite3
 import logging
 import threading
+import asyncio
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -32,7 +33,6 @@ CLONE_TOKEN = 1
 def init_db(db_name="chat_bot.db"):
     conn = sqlite3.connect(db_name)
     cursor = conn.cursor()
-    # Table for users
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -41,7 +41,6 @@ def init_db(db_name="chat_bot.db"):
             is_active INTEGER DEFAULT 1
         )
     """)
-    # Table for storing media files sent to the bot
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS media_store (
             media_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,9 +68,15 @@ def db_execute(query, params=(), fetchone=False, fetchall=False, commit=False, d
     conn.close()
     return result
 
-init_db()
+# Initialize main database
+init_db("chat_bot.db")
+
+def get_db_name(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Retrieves the correct database name depending on whether it's the main bot or a clone."""
+    return context.bot_data.get("db_name", "chat_bot.db")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db_name = get_db_name(context)
     user_id = update.effective_user.id
     default_name = f"User_{str(user_id)[-4:]}"
     db_execute(
@@ -79,11 +84,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ON CONFLICT(user_id) DO UPDATE SET is_active = 1",
         (user_id, default_name),
         commit=True,
+        db_name=db_name,
     )
     user_data = db_execute(
         "SELECT display_name FROM users WHERE user_id = ?",
         (user_id,),
         fetchone=True,
+        db_name=db_name,
     )
     current_name = user_data[0] if user_data else default_name
     welcome_msg = (
@@ -99,7 +106,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_msg, parse_mode="Markdown")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Displays a list of all available commands and their descriptions."""
     help_text = (
         "🤖 *Anonymous Chat Bot - Help Menu* 🤖\n\n"
         "Here are the available commands you can use:\n\n"
@@ -114,6 +120,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 async def set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db_name = get_db_name(context)
     user_id = update.effective_user.id
     if not context.args:
         await update.message.reply_text(
@@ -128,16 +135,19 @@ async def set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "UPDATE users SET display_name = ? WHERE user_id = ?",
         (new_name, user_id),
         commit=True,
+        db_name=db_name,
     )
     await update.message.reply_text(
         f"Your name has been updated to: *{new_name}*", parse_mode="Markdown"
     )
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db_name = get_db_name(context)
     top_users = db_execute(
         "SELECT display_name, message_count FROM users "
         "ORDER BY message_count DESC LIMIT 10",
         fetchall=True,
+        db_name=db_name,
     )
     if not top_users or top_users[0][1] == 0:
         await update.message.reply_text(
@@ -152,10 +162,11 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def sync_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends back all media files saved in the bot's database to the requesting user."""
+    db_name = get_db_name(context)
     media_records = db_execute(
         "SELECT sender_name, file_id, caption, timestamp FROM media_store ORDER BY timestamp ASC",
         fetchall=True,
+        db_name=db_name,
     )
     if not media_records:
         await update.message.reply_text("No media has been shared in this chat yet.")
@@ -199,54 +210,48 @@ async def receive_clone_token(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("⚙️ Initializing and starting your new bot instance...")
 
     def run_bot_instance(token):
-        db_name = f"bot_{token.split(':')[0]}.db"
-        init_db(db_name)
+        try:
+            # Create and set a fresh event loop for this background thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
-        def local_db(query, params=(), fetchone=False, fetchall=False, commit=False):
-            return db_execute(query, params, fetchone, fetchall, commit, db_name)
+            db_name = f"bot_{token.split(':')[0]}.db"
+            init_db(db_name)
 
-        cloned_app = ApplicationBuilder().token(token).build()
+            cloned_app = ApplicationBuilder().token(token).build()
+            cloned_app.bot_data["db_name"] = db_name
 
-        async def cloned_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-            uid = u.effective_user.id
-            d_name = f"User_{str(uid)[-4:]}"
-            local_db(
-                "INSERT INTO users (user_id, display_name) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET is_active = 1",
-                (uid, d_name), commit=True
-            )
-            await u.message.reply_text("Welcome to your cloned Anonymous Chat Bot! Send any message to broadcast.")
-
-        async def cloned_broadcast(u: Update, c: ContextTypes.DEFAULT_TYPE):
-            s_id = u.effective_user.id
-            s_data = local_db("SELECT display_name FROM users WHERE user_id = ?", (s_id,), fetchone=True)
-            s_name = s_data[0] if s_data else f"User_{str(s_id)[-4:]}"
+            # Add all handlers to the cloned bot so it's fully featured
+            cloned_app.add_handler(CommandHandler("start", start))
+            cloned_app.add_handler(CommandHandler("help", help_command))
+            cloned_app.add_handler(CommandHandler("setmyname", set_name))
+            cloned_app.add_handler(CommandHandler("leaderboard", leaderboard))
+            cloned_app.add_handler(CommandHandler("syncmedia", sync_media))
             
-            if not s_data:
-                local_db("INSERT INTO users (user_id, display_name, message_count, is_active) VALUES (?, ?, 1, 1)", (s_id, s_name), commit=True)
-            else:
-                local_db("UPDATE users SET message_count = message_count + 1, is_active = 1 WHERE user_id = ?", (s_id,), commit=True)
+            clone_handler_local = ConversationHandler(
+                entry_points=[CommandHandler("clone", clone_start)],
+                states={
+                    CLONE_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_clone_token)]
+                },
+                fallbacks=[CommandHandler("cancel", cancel_clone)]
+            )
+            cloned_app.add_handler(clone_handler_local)
+            cloned_app.add_handler(
+                MessageHandler(
+                    (filters.TEXT | filters.PHOTO) & ~filters.COMMAND & filters.ChatType.PRIVATE,
+                    broadcast_message,
+                )
+            )
 
-            active_u = local_db("SELECT user_id FROM users WHERE is_active = 1", fetchall=True)
-            if u.message.text:
-                msg = f"*{s_name}*: {u.message.text}"
-                for (rid,) in active_u:
-                    if rid != s_id:
-                        try:
-                            await c.bot.send_message(chat_id=rid, text=msg, parse_mode="Markdown")
-                        except Exception:
-                            local_db("UPDATE users SET is_active = 0 WHERE user_id = ?", (rid,), commit=True)
-
-        cloned_app.add_handler(CommandHandler("start", cloned_start))
-        cloned_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, cloned_broadcast))
-        
-        # Fixed: Pass stop_signals=None so it doesn't crash when running inside a background thread
-        cloned_app.run_polling(stop_signals=None)
+            cloned_app.run_polling(stop_signals=None)
+        except Exception as e:
+            logging.error(f"Failed to run cloned bot instance: {e}")
 
     try:
         threading.Thread(target=run_bot_instance, args=(new_token,), daemon=True).start()
         await update.message.reply_text("✅ Success! Your cloned bot is now up and running. Search for it on Telegram and test it out!")
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to start bot: {e}")
+        await update.message.reply_text(f"❌ Failed to start bot thread: {e}")
 
     return ConversationHandler.END
 
@@ -256,11 +261,13 @@ async def cancel_clone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- BROADCAST HANDLER ---
 async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db_name = get_db_name(context)
     sender_id = update.effective_user.id
     sender_data = db_execute(
         "SELECT display_name FROM users WHERE user_id = ?",
         (sender_id,),
         fetchone=True,
+        db_name=db_name,
     )
     if not sender_data:
         sender_name = f"User_{str(sender_id)[-4:]}"
@@ -269,6 +276,7 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "VALUES (?, ?, 1, 1)",
             (sender_id, sender_name),
             commit=True,
+            db_name=db_name,
         )
     else:
         sender_name = sender_data[0]
@@ -277,9 +285,12 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "WHERE user_id = ?",
             (sender_id,),
             commit=True,
+            db_name=db_name,
         )
     active_users = db_execute(
-        "SELECT user_id FROM users WHERE is_active = 1", fetchall=True
+        "SELECT user_id FROM users WHERE is_active = 1", 
+        fetchall=True, 
+        db_name=db_name
     )
     
     if update.message.text:
@@ -297,6 +308,7 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "UPDATE users SET is_active = 0 WHERE user_id = ?",
                         (recipient_id,),
                         commit=True,
+                        db_name=db_name,
                     )
                     
     elif update.message.photo:
@@ -307,6 +319,7 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "INSERT INTO media_store (sender_id, sender_name, file_id, caption) VALUES (?, ?, ?, ?)",
             (sender_id, sender_name, photo_id, caption_text),
             commit=True,
+            db_name=db_name,
         )
         
         caption = (
@@ -321,17 +334,19 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=recipient_id,
                         photo=photo_id,
                         caption=caption,
-                        parse_mode="Markdown",  # Fixed typo from parse_Mode to parse_mode
+                        parse_mode="Markdown",
                     )
                 except Exception:
                     db_execute(
                         "UPDATE users SET is_active = 0 WHERE user_id = ?",
                         (recipient_id,),
                         commit=True,
+                        db_name=db_name,
                     )
 
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
+    app.bot_data["db_name"] = "chat_bot.db"
     
     clone_handler = ConversationHandler(
         entry_points=[CommandHandler("clone", clone_start)],
@@ -358,4 +373,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
