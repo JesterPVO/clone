@@ -12,7 +12,7 @@ from telegram.ext import (
     filters,
 )
 
-# Updated Main Bot Token
+# Main Bot Token
 TOKEN = "8950125075:AAGmSWaiWuAO2aLyyl17CPohHil7OI3K0KQ"
 
 if not TOKEN:
@@ -238,7 +238,9 @@ async def receive_clone_token(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         cloned_app.add_handler(CommandHandler("start", cloned_start))
         cloned_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, cloned_broadcast))
-        cloned_app.run_polling()
+        
+        # Fixed: Pass stop_signals=None so it doesn't crash when running inside a background thread
+        cloned_app.run_polling(stop_signals=None)
 
     try:
         threading.Thread(target=run_bot_instance, args=(new_token,), daemon=True).start()
@@ -319,7 +321,7 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=recipient_id,
                         photo=photo_id,
                         caption=caption,
-                        parse_Mode="Markdown",
+                        parse_mode="Markdown",  # Fixed typo from parse_Mode to parse_mode
                     )
                 except Exception:
                     db_execute(
@@ -351,8 +353,9 @@ def main():
             broadcast_message,
         )
     )
-    print("Main bot is running with your new token...")
+    print("Main bot is running with your token...")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+    
