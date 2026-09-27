@@ -1,9 +1,9 @@
 import os
 import sqlite3
 import logging
-import threading
+import multiprocessing
 import asyncio
-from telegram import Update
+from telegram import Bot, Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -33,6 +33,7 @@ CLONE_TOKEN = 1
 def init_db(db_name="chat_bot.db"):
     conn = sqlite3.connect(db_name)
     cursor = conn.cursor()
+    # Table for users
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -41,6 +42,7 @@ def init_db(db_name="chat_bot.db"):
             is_active INTEGER DEFAULT 1
         )
     """)
+    # Table for storing media files sent to the bot
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS media_store (
             media_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,6 +53,17 @@ def init_db(db_name="chat_bot.db"):
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Table for tracking cloned bots (only used in main db)
+    if db_name == "chat_bot.db":
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS cloned_bots (
+                bot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER,
+                bot_token TEXT UNIQUE,
+                bot_username TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
     conn.commit()
     conn.close()
 
@@ -72,7 +85,6 @@ def db_execute(query, params=(), fetchone=False, fetchall=False, commit=False, d
 init_db("chat_bot.db")
 
 def get_db_name(context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Retrieves the correct database name depending on whether it's the main bot or a clone."""
     return context.bot_data.get("db_name", "chat_bot.db")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -100,6 +112,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"To view chat statistics, use: `/leaderboard`\n"
         f"To sync/download all shared media, use: `/syncmedia`\n"
         f"To clone and create your own bot, use: `/clone`\n"
+        f"To view all cloned bots, use: `/clonedbot`\n"
         f"To see all commands, use: `/help`\n\n"
         f"Just send any message or photo here, and it will be broadcasted to everyone."
     )
@@ -114,6 +127,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔹 `/leaderboard` - View top chatters and message counts.\n"
         "🔹 `/syncmedia` - Retrieve and download all media shared in the chat.\n"
         "🔹 `/clone` - Create your own identical bot using your BotFather token!\n"
+        "🔹 `/clonedbot` - View a list of all deployed cloned bots.\n"
         "🔹 `/help` - Show this help menu.\n\n"
         "💬 *Broadcasting:* Send any text or photo to broadcast it anonymously!"
     )
@@ -186,6 +200,22 @@ async def sync_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text(f"⚠️ Could not load media from *{sender_name}* (expired or deleted).")
 
+async def list_cloned_bots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows all cloned bots created through this system."""
+    cloned_bots = db_execute(
+        "SELECT bot_username, timestamp FROM cloned_bots ORDER BY timestamp DESC",
+        fetchall=True,
+        db_name="chat_bot.db"
+    )
+    if not cloned_bots:
+        await update.message.reply_text("No cloned bots have been created yet.")
+        return
+
+    text = "🤖 *Deployed Cloned Bots* 🤖\n\n"
+    for username, timestamp in cloned_bots:
+        text += f"• @{username} (Created: {timestamp})\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
 # --- CLONE COMMAND LOGIC ---
 async def clone_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -200,6 +230,41 @@ async def clone_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return CLONE_TOKEN
 
+def run_bot_process(token):
+    """Target function to run a cloned bot instance inside an isolated background process."""
+    try:
+        db_name = f"bot_{token.split(':')[0]}.db"
+        init_db(db_name)
+
+        cloned_app = ApplicationBuilder().token(token).build()
+        cloned_app.bot_data["db_name"] = db_name
+
+        cloned_app.add_handler(CommandHandler("start", start))
+        cloned_app.add_handler(CommandHandler("help", help_command))
+        cloned_app.add_handler(CommandHandler("setmyname", set_name))
+        cloned_app.add_handler(CommandHandler("leaderboard", leaderboard))
+        cloned_app.add_handler(CommandHandler("syncmedia", sync_media))
+        cloned_app.add_handler(CommandHandler("clonedbot", list_cloned_bots))
+        
+        clone_handler_local = ConversationHandler(
+            entry_points=[CommandHandler("clone", clone_start)],
+            states={
+                CLONE_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_clone_token)]
+            },
+            fallbacks=[CommandHandler("cancel", cancel_clone)]
+        )
+        cloned_app.add_handler(clone_handler_local)
+        cloned_app.add_handler(
+            MessageHandler(
+                (filters.TEXT | filters.PHOTO) & ~filters.COMMAND & filters.ChatType.PRIVATE,
+                broadcast_message,
+            )
+        )
+
+        cloned_app.run_polling()
+    except Exception as e:
+        logging.error(f"Cloned bot process error: {e}")
+
 async def receive_clone_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_token = update.message.text.strip()
     
@@ -207,51 +272,34 @@ async def receive_clone_token(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Invalid token format. Please send a valid BotFather token or type /cancel.")
         return CLONE_TOKEN
 
-    await update.message.reply_text("⚙️ Initializing and starting your new bot instance...")
-
-    def run_bot_instance(token):
-        try:
-            # Create and set a fresh event loop for this background thread
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-            db_name = f"bot_{token.split(':')[0]}.db"
-            init_db(db_name)
-
-            cloned_app = ApplicationBuilder().token(token).build()
-            cloned_app.bot_data["db_name"] = db_name
-
-            # Add all handlers to the cloned bot so it's fully featured
-            cloned_app.add_handler(CommandHandler("start", start))
-            cloned_app.add_handler(CommandHandler("help", help_command))
-            cloned_app.add_handler(CommandHandler("setmyname", set_name))
-            cloned_app.add_handler(CommandHandler("leaderboard", leaderboard))
-            cloned_app.add_handler(CommandHandler("syncmedia", sync_media))
-            
-            clone_handler_local = ConversationHandler(
-                entry_points=[CommandHandler("clone", clone_start)],
-                states={
-                    CLONE_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_clone_token)]
-                },
-                fallbacks=[CommandHandler("cancel", cancel_clone)]
-            )
-            cloned_app.add_handler(clone_handler_local)
-            cloned_app.add_handler(
-                MessageHandler(
-                    (filters.TEXT | filters.PHOTO) & ~filters.COMMAND & filters.ChatType.PRIVATE,
-                    broadcast_message,
-                )
-            )
-
-            cloned_app.run_polling(stop_signals=None)
-        except Exception as e:
-            logging.error(f"Failed to run cloned bot instance: {e}")
+    await update.message.reply_text("⚙️ Verifying token and starting your new bot instance...")
 
     try:
-        threading.Thread(target=run_bot_instance, args=(new_token,), daemon=True).start()
-        await update.message.reply_text("✅ Success! Your cloned bot is now up and running. Search for it on Telegram and test it out!")
+        # Verify token and fetch bot username
+        temp_bot = Bot(token=new_token)
+        bot_info = await temp_bot.get_me()
+        bot_username = bot_info.username
+
+        # Save to database
+        db_execute(
+            "INSERT OR IGNORE INTO cloned_bots (owner_id, bot_token, bot_username) VALUES (?, ?, ?)",
+            (update.effective_user.id, new_token, bot_username),
+            commit=True,
+            db_name="chat_bot.db"
+        )
+
+        # Start isolated process
+        process = multiprocessing.Process(target=run_bot_process, args=(new_token,))
+        process.daemon = True
+        process.start()
+
+        await update.message.reply_text(
+            f"✅ Success! Your cloned bot is now running.\n"
+            f"Search for it on Telegram: @{bot_username}",
+            parse_mode="Markdown"
+        )
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to start bot thread: {e}")
+        await update.message.reply_text(f"❌ Failed to start bot. Make sure your token is correct. Error: {e}")
 
     return ConversationHandler.END
 
@@ -345,6 +393,9 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
 
 def main():
+    # Required for safe multiprocessing across platforms
+    multiprocessing.freeze_support()
+
     app = ApplicationBuilder().token(TOKEN).build()
     app.bot_data["db_name"] = "chat_bot.db"
     
@@ -361,6 +412,7 @@ def main():
     app.add_handler(CommandHandler("setmyname", set_name))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("syncmedia", sync_media))
+    app.add_handler(CommandHandler("clonedbot", list_cloned_bots))
     app.add_handler(clone_handler)
     app.add_handler(
         MessageHandler(
